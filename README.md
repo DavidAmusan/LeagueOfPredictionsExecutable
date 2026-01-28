@@ -9,10 +9,6 @@ An intelligent real-time champion select monitor that uses machine learning to p
 - Win percentage predictions for each team
 - Trained on thousands of real match data
 
-💡 **Smart Champion Recommendations**
-- Recommends top 5 champions to maximize your team's win chance
-- Updates automatically when enemy completes their picks
-- Shows enemy's best picks to help you anticipate their choices
 
 🎮 **Real-Time Monitoring**
 - Automatically detects when you enter champion select
@@ -21,8 +17,6 @@ An intelligent real-time champion select monitor that uses machine learning to p
 - Highlights which position is YOU
 
 ⚡ **State-Smart Updates**
-- Only generates new predictions when champion selections change
-- No spam - efficient and focused
 - Shows match prediction in the final phase
 
 ## Requirements
@@ -181,14 +175,6 @@ Enemy Team: Yuumi, Pyke, Morgana
 🤖 AI PREDICTIONS
 ================================================================================
 
-💡 CHAMPION RECOMMENDATIONS FOR YOUR TEAM:
-
-   1. Leona                → 58.3% win chance
-   2. Thresh                → 57.1% win chance
-   3. Nautilus              → 56.8% win chance
-   4. Braum                 → 56.2% win chance
-   5. Alistar               → 55.7% win chance
-================================================================================
 ```
 
 ## Troubleshooting
