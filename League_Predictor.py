@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """
 League of Legends Champion Select AI Predictor
-Combines real-time champion select monitoring with ML-based win prediction
-and champion recommendations.
+Post-champion-select analysis with PMVP, objective predictions, and winner.
 
 Requirements:
 - games.csv (training data)
 - champion_info.json (champion ID/name mappings)
 - League of Legends client running
 
-Usage: python3 lol_ai_predictor.py
+Usage: python3 League_Predictor_Updated.py
 """
 
 import requests
@@ -138,7 +137,7 @@ def get_champion_name(champion_id, id_to_name):
 
 
 # ============================================================
-# MODEL TRAINING (EXACT ORIGINAL ARCHITECTURE)
+# MODEL TRAINING
 # ============================================================
 
 def build_optimized_model(
@@ -162,19 +161,13 @@ def build_optimized_model(
     EXACT model from LegendModels.ipynb - WinnerPrimary configuration
     Architecture with 5 layers (4 shared + stats/winner branches)
     Uses stats concatenation in winner branch for better predictions.
-    
-    Key differences from generic model:
-    - Stats output uses SIGMOID activation (for binary/normalized stats)
-    - Winner branch CONCATENATES shared layer + predicted stats
-    - Binary crossentropy for stats loss (not MAE)
-    - Winner weight = 0.88 (heavily favors winner prediction)
     """
     from tensorflow import keras
     
     # Input layer
     input_layer = keras.layers.Input(shape=(input_dim,), name='champion_input')
 
-    # Layer 1: Deep shared trunk
+    # Layer 1
     x = keras.layers.Dense(
         layer1_units,
         activation='relu',
@@ -214,7 +207,7 @@ def build_optimized_model(
         shared = keras.layers.BatchNormalization()(shared)
     shared = keras.layers.Dropout(dropout_rate * 0.5)(shared)
 
-    # Stats prediction branch (Layer 5a)
+    # Stats prediction branch
     stats_branch = keras.layers.Dense(
         stats_branch_units,
         activation='relu',
@@ -224,15 +217,13 @@ def build_optimized_model(
         stats_branch = keras.layers.BatchNormalization()(stats_branch)
     stats_branch = keras.layers.Dropout(dropout_rate * 0.5)(stats_branch)
     
-    # CRITICAL: Sigmoid activation for binary/normalized stats
     stats_output = keras.layers.Dense(
         output_stats_dim,
         activation='sigmoid',
         name='stats_output'
     )(stats_branch)
 
-    # Winner prediction branch (Layer 5b)
-    # CRITICAL: Concatenate shared features WITH predicted stats
+    # Winner prediction branch - concatenates shared + stats
     winner_input = keras.layers.Concatenate()([shared, stats_output])
     
     winner_branch = keras.layers.Dense(
@@ -260,8 +251,7 @@ def build_optimized_model(
     # Create model
     model = keras.Model(inputs=input_layer, outputs=[stats_output, winner_output])
 
-    # Compile with multi-task loss
-    # CRITICAL: Binary crossentropy for both outputs (stats are 0/1)
+    # Compile
     model.compile(
         optimizer=keras.optimizers.Adam(learning_rate=learning_rate),
         loss={
@@ -318,7 +308,7 @@ def load_and_train_model():
     scaler_stats = StandardScaler()
     y_stats_scaled = scaler_stats.fit_transform(y_stats)
     
-    # Build and train model with WinnerPrimary configuration
+    # Build and train model
     print("🧠 Training AI model (WinnerPrimary config)...")
     model = build_optimized_model(
         input_dim=len(champion_features),
@@ -352,6 +342,7 @@ def load_and_train_model():
         factor=0.5,
         patience=7,
         min_lr=0.00001,
+        mode='min',
         verbose=0
     )
     
@@ -378,13 +369,14 @@ def load_and_train_model():
 # PREDICTION FUNCTIONS
 # ============================================================
 
-def predict_winner(t1_champs, t2_champs, model, scaler, stat_features):
-    """Predict winner given full team compositions"""
-    # Clean the input lists - remove any None or 0 values
+def predict_game_outcome(t1_champs, t2_champs, model, scaler, stat_features):
+    """
+    Predict winner and game statistics.
+    Returns full prediction including stats for objectives.
+    """
     t1_clean = [c for c in t1_champs if c and c != 0]
     t2_clean = [c for c in t2_champs if c and c != 0]
     
-    # Check if we have valid 5v5
     if len(t1_clean) != 5 or len(t2_clean) != 5:
         return None
     
@@ -392,72 +384,107 @@ def predict_winner(t1_champs, t2_champs, model, scaler, stat_features):
         game_input = np.array([t1_clean + t2_clean], dtype=np.float32)
         stats_pred, winner_pred = model.predict(game_input, verbose=0)
         
+        # Unscale stats
+        stats_unscaled = scaler.inverse_transform(stats_pred)[0]
+        
+        # Winner probabilities
         winner_prob = winner_pred[0][0]
         team1_prob = (1 - winner_prob) * 100
         team2_prob = winner_prob * 100
         
+        # Map stats to dict
+        stats_dict = {stat_features[i]: float(stats_unscaled[i]) for i in range(len(stat_features))}
+        
         return {
             'team1_probability': team1_prob,
             'team2_probability': team2_prob,
-            'predicted_winner': 1 if team1_prob > team2_prob else 2
+            'predicted_winner': 1 if team1_prob > team2_prob else 2,
+            'stats': stats_dict
         }
     except Exception as e:
-        print(f"Error in predict_winner: {e}")
+        print(f"Error in prediction: {e}")
         return None
 
 
+def interpret_stat_prediction(value):
+    """
+    Interpret stat predictions into discrete outcomes.
+    < 0.5: Contested
+    0.5 - 1.0: Team gets 1
+    1.0 - 1.5: Contested
+    > 1.5: Team gets 2
+    """
+    if value < 0.5:
+        return "Contested"
+    elif value <= 1.0:
+        return "1"
+    elif value <= 1.5:
+        return "Contested"
+    else:
+        return "2"
 
-def recommend_champion_for_team(team1_partial, team2_partial, model, all_champions, top_n=5):
+
+def calculate_pmvp(my_team, their_team, model, all_champions, id_to_name):
     """
-    Recommend champions for incomplete team.
-    FIXED: Now handles cases where BOTH teams are incomplete.
+    Calculate PMVP (Predicted Most Valuable Pick) for each team.
+    Tests removing each champion and sees win rate impact.
     """
-    # Clean the inputs
-    team1_current = [c for c in team1_partial if c and c != 0]
-    team2_current = [c for c in team2_partial if c and c != 0]
-    
-    # Can't recommend if team1 is already full
-    if len(team1_current) >= 5:
-        return []
-    
-    # Calculate missing slots for both teams
-    team1_missing = 5 - len(team1_current)
-    team2_missing = 5 - len(team2_current)
-    
-    # Get already picked champions
-    already_picked = set(team1_current + team2_current)
-    available_champions = [c for c in all_champions if c not in already_picked]
-    
-    # Pad both teams to 5 champions
-    team1_base = team1_current + [0] * team1_missing
-    team2_base = team2_current + [0] * team2_missing
-    
-    results = []
-    
-    try:
-        for champion_id in available_champions:
-            # Test adding this champion to team1
-            team1_test = team1_base.copy()
-            first_empty_idx = team1_test.index(0)
-            team1_test[first_empty_idx] = champion_id
-            
-            # Create full game input
-            game_input = np.array([team1_test + team2_base], dtype=np.float32)
+    def test_without_champion(team, opponent, exclude_idx):
+        """Test win rate with one champion removed"""
+        test_team = [c for i, c in enumerate(team) if i != exclude_idx]
+        
+        # Test with average champions
+        available = [c for c in all_champions if c not in test_team and c not in opponent]
+        if not available:
+            return None
+        
+        results = []
+        for replacement in available[:20]:  # Test top 20 available
+            test_full = test_team[:exclude_idx] + [replacement] + test_team[exclude_idx:]
+            game_input = np.array([test_full + opponent], dtype=np.float32)
             _, winner_pred = model.predict(game_input, verbose=0)
-            
-            # Team1 win probability
-            team1_win_prob = (1 - winner_pred[0][0]) * 100
-            
-            results.append({
-                'champion_id': champion_id,
-                'win_probability': team1_win_prob
-            })
-    except Exception as e:
-        print(f"Error in recommend_champion_for_team: {e}")
-        return []
+            team1_prob = (1 - winner_pred[0][0]) * 100
+            results.append(team1_prob)
+        
+        return np.mean(results) if results else None
     
-    results.sort(key=lambda x: x['win_probability'], reverse=True)
-    return results[:top_n]
+    # Calculate baseline
+    game_input = np.array([my_team + their_team], dtype=np.float32)
+    _, winner_pred = model.predict(game_input, verbose=0)
+    baseline_my_team = (1 - winner_pred[0][0]) * 100
+    baseline_their_team = 100 - baseline_my_team
+    
+    # Test each champion on my team
+    my_impacts = []
+    for i in range(5):
+        without_prob = test_without_champion(my_team, their_team, i)
+        if without_prob is not None:
+            impact = baseline_my_team - without_prob  # Positive = champion increases win rate
+            my_impacts.append({
+                'champion_id': my_team[i],
+                'champion_name': get_champion_name(my_team[i], id_to_name),
+                'impact': impact
+            })
+    
+    # Test each champion on their team
+    their_impacts = []
+    for i in range(5):
+        # For enemy team, we need to flip perspective
+        without_prob = test_without_champion(their_team, my_team, i)
+        if without_prob is not None:
+            # without_prob is their team's win rate without this champion
+            impact = baseline_their_team - without_prob
+            their_impacts.append({
+                'champion_id': their_team[i],
+                'champion_name': get_champion_name(their_team[i], id_to_name),
+                'impact': impact
+            })
+    
+    # Find MVPs
+    my_mvp = max(my_impacts, key=lambda x: x['impact']) if my_impacts else None
+    their_mvp = max(their_impacts, key=lambda x: x['impact']) if their_impacts else None
+    
+    return my_mvp, their_mvp
 
 
 # ============================================================
@@ -469,45 +496,157 @@ def clear_screen():
     os.system('clear')
 
 
-class PredictionLog:
-    """Manages persistent prediction log"""
+class PredictionDisplay:
+    """Manages persistent prediction display"""
     def __init__(self):
-        self.logs = []
-        self.current_session_id = None
-        self.predictions_made = set()  # Track which predictions we've made
+        self.predictions = None
+        self.my_team = []
+        self.their_team = []
+        self.my_team_names = []
+        self.their_team_names = []
     
-    def new_session(self):
-        """Start a new champion select session"""
-        self.logs = []
-        self.predictions_made = set()
-        self.current_session_id = time.time()
+    def set_predictions(self, predictions, my_team, their_team, my_team_names, their_team_names):
+        """Store predictions to display persistently"""
+        self.predictions = predictions
+        self.my_team = my_team
+        self.their_team = their_team
+        self.my_team_names = my_team_names
+        self.their_team_names = their_team_names
     
-    def add_prediction(self, message, prediction_key=None):
-        """Add a prediction to the log"""
-        # Prevent duplicate predictions for the same stage
-        if prediction_key and prediction_key in self.predictions_made:
+    def clear(self):
+        """Clear predictions for new session"""
+        self.predictions = None
+        self.my_team = []
+        self.their_team = []
+        self.my_team_names = []
+        self.their_team_names = []
+    
+    def display(self, phase="", time_left=0):
+        """Display predictions"""
+        clear_screen()
+        print("=" * 80)
+        print(" " * 20 + "🤖 LoL CHAMPION SELECT AI PREDICTOR")
+        print("=" * 80)
+        print(f"Updated: {time.strftime('%H:%M:%S')}" + " " * 25 + "Press Ctrl+C to stop")
+        print()
+        if phase:
+            print(f"📍 Phase: {phase}")
+            print(f"⏱️  Time Remaining: {int(time_left)}s")
+        print()
+        
+        if not self.predictions:
+            print("⏳ Waiting for champion select to complete...\n")
             return
         
-        timestamp = time.strftime('%H:%M:%S')
-        self.logs.append(f"[{timestamp}] {message}")
+        pred = self.predictions
         
-        if prediction_key:
-            self.predictions_made.add(prediction_key)
-    
-    def display(self):
-        """Display all logged predictions"""
-        if self.logs:
-            print("\n" + "=" * 80)
-            print("📜 PREDICTION HISTORY")
-            print("=" * 80)
-            for log in self.logs:
-                print(log)
-            print("=" * 80)
+        # Display teams
+        print("─" * 80)
+        print("🟦 YOUR TEAM")
+        print("─" * 80)
+        for name in self.my_team_names:
+            print(f"  • {name}")
+        
+        print()
+        print("─" * 80)
+        print("🟥 ENEMY TEAM")
+        print("─" * 80)
+        for name in self.their_team_names:
+            print(f"  • {name}")
+        
+        # Predictions
+        print()
+        print("=" * 80)
+        print("📊 MATCH PREDICTIONS")
+        print("=" * 80)
+        
+        # Winner
+        winner_team = "Your Team" if pred['predicted_winner'] == 1 else "Enemy Team"
+        team1_prob = pred['team1_probability']
+        team2_prob = pred['team2_probability']
+        
+        print(f"\n🏆 PREDICTED WINNER: {winner_team}")
+        print(f"   Your Team:  {team1_prob:.1f}%")
+        print(f"   Enemy Team: {team2_prob:.1f}%")
+        
+        diff = abs(team1_prob - team2_prob)
+        if diff >= 15:
+            if team1_prob > team2_prob:
+                print(f"   ✨ Strong advantage for your team!")
+            else:
+                print(f"   ⚠️  Enemy team has strong advantage")
+        elif diff >= 8:
+            if team1_prob > team2_prob:
+                print(f"   💪 Your team is favored")
+            else:
+                print(f"   😬 Enemy team is favored")
+        else:
+            print(f"   ⚖️  Even matchup!")
+        
+        # PMVP
+        if 'my_mvp' in pred and pred['my_mvp']:
+            print(f"\n⭐ YOUR TEAM PMVP: {pred['my_mvp']['champion_name']}")
+            print(f"   Impact: +{pred['my_mvp']['impact']:.1f}% win rate")
+        
+        if 'their_mvp' in pred and pred['their_mvp']:
+            print(f"\n⭐ ENEMY TEAM PMVP: {pred['their_mvp']['champion_name']}")
+            print(f"   Impact: +{pred['their_mvp']['impact']:.1f}% win rate")
+        
+        # Objectives
+        stats = pred['stats']
+        
+        print(f"\n🎯 OBJECTIVE PREDICTIONS")
+        print(f"   (Based on predicted game statistics)")
+        
+        # First Tower
+        t1_towers = stats.get('t1_towerKills', 0)
+        t2_towers = stats.get('t2_towerKills', 0)
+        first_tower_t1 = interpret_stat_prediction(t1_towers)
+        first_tower_t2 = interpret_stat_prediction(t2_towers)
+        
+        if first_tower_t1 == "Contested" or first_tower_t2 == "Contested":
+            print(f"\n🏰 First Turret: Contested")
+        elif first_tower_t1 != "Contested" and float(first_tower_t1) > 0:
+            print(f"\n🏰 First Turret: Your Team (predicted {first_tower_t1} towers)")
+        elif first_tower_t2 != "Contested" and float(first_tower_t2) > 0:
+            print(f"\n🏰 First Turret: Enemy Team (predicted {first_tower_t2} towers)")
+        else:
+            print(f"\n🏰 First Turret: Contested")
+        
+        # First Dragon
+        t1_dragons = stats.get('t1_dragonKills', 0)
+        t2_dragons = stats.get('t2_dragonKills', 0)
+        first_dragon_t1 = interpret_stat_prediction(t1_dragons)
+        first_dragon_t2 = interpret_stat_prediction(t2_dragons)
+        
+        if first_dragon_t1 == "Contested" or first_dragon_t2 == "Contested":
+            print(f"🐉 First Dragon: Contested")
+        elif first_dragon_t1 != "Contested" and float(first_dragon_t1) > 0:
+            print(f"🐉 First Dragon: Your Team (predicted {first_dragon_t1} dragons)")
+        elif first_dragon_t2 != "Contested" and float(first_dragon_t2) > 0:
+            print(f"🐉 First Dragon: Enemy Team (predicted {first_dragon_t2} dragons)")
+        else:
+            print(f"🐉 First Dragon: Contested")
+        
+        # First Blood (approximation based on general aggression)
+        # We'll use a simple heuristic: team with higher predicted stats is more aggressive
+        t1_aggression = t1_towers + t1_dragons + stats.get('t1_riftHeraldKills', 0)
+        t2_aggression = t2_towers + t2_dragons + stats.get('t2_riftHeraldKills', 0)
+        
+        if abs(t1_aggression - t2_aggression) < 0.5:
+            print(f"💀 First Blood: Contested")
+        elif t1_aggression > t2_aggression:
+            print(f"💀 First Blood: Your Team (higher predicted aggression)")
+        else:
+            print(f"💀 First Blood: Enemy Team (higher predicted aggression)")
+        
+        print()
+        print("=" * 80)
 
 
 def display_session(session, id_to_name, model, scaler, stat_features, all_champions, 
-                    prediction_log, last_state):
-    """Display formatted champion select session with predictions"""
+                    prediction_display, last_state):
+    """Monitor champion select and make predictions when complete"""
     
     # Extract team data
     my_team = session.get('myTeam', [])
@@ -521,254 +660,54 @@ def display_session(session, id_to_name, model, scaler, stat_features, all_champ
     
     # Build team lists
     my_team_locked = []
-    my_team_hovering = []
     their_team_locked = []
-    their_team_hovering = []
     
     for player in my_team:
         champion_id = player.get('championId', 0)
-        intent_id = player.get('championPickIntent', 0)
-        
         if champion_id > 0:
             my_team_locked.append(champion_id)
-        elif intent_id > 0:
-            my_team_hovering.append(intent_id)
     
     for player in their_team:
         champion_id = player.get('championId', 0)
-        intent_id = player.get('championPickIntent', 0)
-        
         if champion_id > 0:
             their_team_locked.append(champion_id)
-        elif intent_id > 0:
-            their_team_hovering.append(intent_id)
     
     # Create state for change detection
     current_state = {
         'my_locked': tuple(sorted(my_team_locked)),
-        'my_hovering': tuple(sorted(my_team_hovering)),
         'their_locked': tuple(sorted(their_team_locked)),
-        'their_hovering': tuple(sorted(their_team_hovering)),
         'phase': phase
     }
     
-    # Display header (always)
-    clear_screen()
-    print("=" * 80)
-    print(" " * 20 + "🤖 LoL CHAMPION SELECT AI PREDICTOR")
-    print("=" * 80)
-    print(f"Updated: {time.strftime('%H:%M:%S')}" + " " * 25 + "Press Ctrl+C to stop")
-    print()
-    print(f"📍 Phase: {phase}")
-    print(f"⏱️  Time Remaining: {int(time_left)}s")
-    print()
-    
-    # Display teams
-    print("─" * 80)
-    print("🟦 YOUR TEAM")
-    print("─" * 80)
-    
-    for player in sorted(my_team, key=lambda x: x.get('cellId', 0)):
-        cell_id = player.get('cellId', -1)
-        champion_id = player.get('championId', 0)
-        intent_id = player.get('championPickIntent', 0)
-        position = player.get('assignedPosition', 'FILL')
-        
-        position_emoji = {
-            'top': '🔝', 'jungle': '🌲', 'middle': '⭐',
-            'bottom': '🎯', 'utility': '💚'
-        }.get(position.lower(), '❓')
-        
-        is_you = (cell_id == local_player_cell_id)
-        you_marker = " ← YOU" if is_you else ""
-        
-        if champion_id > 0:
-            champ_name = get_champion_name(champion_id, id_to_name)
-            status = "✅ LOCKED"
-            display_name = champ_name
-        elif intent_id > 0:
-            champ_name = get_champion_name(intent_id, id_to_name)
-            status = "👀 Hovering"
-            display_name = champ_name
-        else:
-            display_name = "Not selected"
-            status = "⏳ Waiting"
-        
-        print(f"{position_emoji} [{position.upper():8}] {display_name:25} {status}{you_marker}")
-    
-    if their_team:
-        print()
-        print("─" * 80)
-        print("🟥 ENEMY TEAM")
-        print("─" * 80)
-        
-        for player in sorted(their_team, key=lambda x: x.get('cellId', 0)):
-            champion_id = player.get('championId', 0)
-            intent_id = player.get('championPickIntent', 0)
-            position = player.get('assignedPosition', 'UNKNOWN')
+    # Check if both teams are complete (10 champions total)
+    if len(my_team_locked) == 5 and len(their_team_locked) == 5:
+        # Make predictions if not already done for this composition
+        if current_state != last_state:
+            # Get predictions
+            prediction = predict_game_outcome(my_team_locked, their_team_locked, model, scaler, stat_features)
             
-            position_emoji = {
-                'top': '🔝', 'jungle': '🌲', 'middle': '⭐',
-                'bottom': '🎯', 'utility': '💚'
-            }.get(position.lower(), '❓')
-            
-            if champion_id > 0:
-                champ_name = get_champion_name(champion_id, id_to_name)
-                display_name = champ_name
-                status = "✅ LOCKED"
-            elif intent_id > 0:
-                champ_name = get_champion_name(intent_id, id_to_name)
-                display_name = champ_name
-                status = "👀 Hovering"
-            else:
-                display_name = "Not selected"
-                status = "⏳ Waiting"
-            
-            print(f"{position_emoji} [{position.upper():8}] {display_name:25} {status}")
-    
-    # Bans
-    bans = session.get('bans', {})
-    my_team_bans = bans.get('myTeamBans', [])
-    their_team_bans = bans.get('theirTeamBans', [])
-    
-    if my_team_bans or their_team_bans:
-        print()
-        print("─" * 80)
-        print("🚫 BANS")
-        print("─" * 80)
-        
-        my_bans_str = [get_champion_name(b, id_to_name) for b in my_team_bans if b > 0]
-        their_bans_str = [get_champion_name(b, id_to_name) for b in their_team_bans if b > 0]
-        
-        print(f"Your Team:  {', '.join(my_bans_str) if my_bans_str else 'None yet'}")
-        print(f"Enemy Team: {', '.join(their_bans_str) if their_bans_str else 'None yet'}")
-    
-    # AI PREDICTIONS - Generate new predictions if state changed
-    if current_state != last_state:
-        # Track total picks to determine draft stage
-        total_my_picks = len(my_team_locked)
-        total_their_picks = len(their_team_locked)
-        total_picks = total_my_picks + total_their_picks
-        
-        # Both teams have 5 locked - FINAL prediction (Prediction #6)
-        if total_my_picks == 5 and total_their_picks == 5:
-            prediction = predict_winner(my_team_locked, their_team_locked, model, scaler, stat_features)
             if prediction:
-                team1_prob = prediction['team1_probability']
-                team2_prob = prediction['team2_probability']
+                # Calculate PMVP
+                my_mvp, their_mvp = calculate_pmvp(my_team_locked, their_team_locked, model, all_champions, id_to_name)
                 
-                msg = f"🎯 FINAL PREDICTION: Your Team {team1_prob:.1f}% | Enemy {team2_prob:.1f}%"
-                prediction_log.add_prediction(msg, prediction_key="final")
+                prediction['my_mvp'] = my_mvp
+                prediction['their_mvp'] = their_mvp
                 
-                # Better thresholds for matchup evaluation
-                diff = abs(team1_prob - team2_prob)
-                if diff >= 15:  # 65-35 or more extreme
-                    if team1_prob > team2_prob:
-                        prediction_log.add_prediction("   ✨ Strong advantage for your team!")
-                    else:
-                        prediction_log.add_prediction("   ⚠️  Enemy team has the advantage")
-                elif diff >= 8:  # 58-42 to 65-35
-                    if team1_prob > team2_prob:
-                        prediction_log.add_prediction("   💪 Your team is favored")
-                    else:
-                        prediction_log.add_prediction("   😬 Enemy team is favored")
-                else:  # Less than 58-42
-                    prediction_log.add_prediction("   ⚖️  Even matchup!")
-        
-        # During picking phase - predict based on League's 1-2-2-2-2-1 format
-        # Blue side (your team): You(1) -> Enemy(2,3) -> You(4,5) -> Enemy(6,7) -> You(8,9) -> Enemy(10)
-        # Red side (enemy team): Enemy(1) -> You(2,3) -> Enemy(4,5) -> You(6,7) -> Enemy(8,9) -> You(10)
-        elif total_picks > 0 and total_picks < 10:
-            should_predict = False
-            predict_for_enemy = False
-            prediction_stage = None
-            
-            # After 3 total picks (1-2-2 pattern complete) - Prediction #1
-            if total_picks == 3:
-                should_predict = True
-                prediction_stage = "stage_3"
-                # If your team has 1 pick, enemy picked 2-3, recommend for your team (picks 4-5)
-                # If enemy has 1 pick, you picked 2-3, predict enemy (picks 4-5)
-                if total_my_picks == 1:
-                    predict_for_enemy = False
-                elif total_their_picks == 1:
-                    predict_for_enemy = True
-            
-            # After 5 total picks (1-2-2-2 pattern complete) - Prediction #2
-            elif total_picks == 5:
-                should_predict = True
-                prediction_stage = "stage_5"
-                # Whoever has 3 picks just finished their 4-5 picks
-                if total_my_picks == 3:
-                    predict_for_enemy = True  # Predict enemy (picks 6-7)
-                elif total_their_picks == 3:
-                    predict_for_enemy = False  # Recommend for your team (picks 6-7)
-            
-            # After 7 total picks (1-2-2-2-2 pattern complete) - Prediction #3
-            elif total_picks == 7:
-                should_predict = True
-                prediction_stage = "stage_7"
-                # Whoever has 4 picks just finished their 6-7 picks
-                if total_my_picks == 4:
-                    predict_for_enemy = True  # Predict enemy (picks 8-9)
-                elif total_their_picks == 4:
-                    predict_for_enemy = False  # Recommend for your team (picks 8-9)
-            
-            # After 9 total picks (1-2-2-2-2-1 pattern complete) - Prediction #4
-            elif total_picks == 9:
-                should_predict = True
-                prediction_stage = "stage_9"
-                # Whoever has 5 picks just finished their 8-9 picks
-                if total_my_picks == 5:
-                    predict_for_enemy = True  # Predict enemy (pick 10)
-                elif total_their_picks == 5:
-                    predict_for_enemy = False  # Recommend for your team (pick 10)
-            
-            # Make the prediction
-            if should_predict and prediction_stage:
-                if predict_for_enemy:
-                    # Predict what enemy will pick
-                    their_team_partial = their_team_locked + their_team_hovering
-                    my_team_partial = my_team_locked
-                    
-                    recommendations = recommend_champion_for_team(
-                        their_team_partial, my_team_partial, model, all_champions, top_n=3
-                    )
-                    
-                    if recommendations:
-                        prediction_log.add_prediction(
-                            f"👁️  ENEMY LIKELY TO PICK:",
-                            prediction_key=prediction_stage
-                        )
-                        for i, rec in enumerate(recommendations[:3], 1):
-                            champ_name = get_champion_name(rec['champion_id'], id_to_name)
-                            prediction_log.add_prediction(
-                                f"   {i}. {champ_name:20} → {rec['win_probability']:.1f}% (for them)"
-                            )
+                # Get champion names
+                my_team_names = [get_champion_name(c, id_to_name) for c in my_team_locked]
+                their_team_names = [get_champion_name(c, id_to_name) for c in their_team_locked]
                 
-                else:
-                    # Recommend for your team
-                    my_team_partial = my_team_locked + my_team_hovering
-                    their_team_partial = their_team_locked
-                    
-                    recommendations = recommend_champion_for_team(
-                        my_team_partial, their_team_partial, model, all_champions, top_n=5
-                    )
-                    
-                    if recommendations:
-                        prediction_log.add_prediction(
-                            f"💡 RECOMMENDATIONS FOR YOUR TEAM:",
-                            prediction_key=prediction_stage
-                        )
-                        for i, rec in enumerate(recommendations[:5], 1):
-                            champ_name = get_champion_name(rec['champion_id'], id_to_name)
-                            prediction_log.add_prediction(
-                                f"   {i}. {champ_name:20} → {rec['win_probability']:.1f}%"
-                            )
-
+                # Store predictions
+                prediction_display.set_predictions(
+                    prediction, 
+                    my_team_locked, 
+                    their_team_locked,
+                    my_team_names,
+                    their_team_names
+                )
     
-    # Display persistent log
-    prediction_log.display()
+    # Display (will show predictions if available)
+    prediction_display.display(phase, time_left)
     
     return current_state
 
@@ -789,7 +728,7 @@ def main():
     id_to_name, name_to_id = load_champion_mapping()
     print(f"✓ Loaded {len(id_to_name)} champions")
     
-    # Train model in a separate thread for speed
+    # Train model in a separate thread
     print("🚀 Starting model training in background thread...")
     model_data = {'model': None, 'scaler': None, 'stat_features': None, 'all_champions': None, 'ready': False}
     
@@ -808,7 +747,7 @@ def main():
     client = LCUClient()
     in_champ_select = False
     last_state = None
-    prediction_log = PredictionLog()
+    prediction_display = PredictionDisplay()
     
     print()
     print("✓ Ready! Waiting for League of Legends client...")
@@ -831,10 +770,10 @@ def main():
             
             if session:
                 if not in_champ_select:
-                    # NEW CHAMPION SELECT - Clear everything
-                    prediction_log.new_session()
+                    # NEW CHAMPION SELECT - Clear predictions
+                    prediction_display.clear()
                     if model_data['ready']:
-                        print("\n🎮 Entered Champion Select - Starting AI predictions...\n")
+                        print("\n🎮 Entered Champion Select - Waiting for picks...\n")
                     else:
                         print("\n🎮 Entered Champion Select - Model still training...\n")
                     time.sleep(1)
@@ -847,13 +786,16 @@ def main():
                         session, id_to_name, 
                         model_data['model'], model_data['scaler'], 
                         model_data['stat_features'], model_data['all_champions'], 
-                        prediction_log, last_state
+                        prediction_display, last_state
                     )
             else:
                 if in_champ_select:
-                    # Keep showing predictions after champ select ends
-                    # Don't clear - let user see final predictions
+                    # Left champ select - keep showing predictions
                     in_champ_select = False
+                
+                # Keep displaying predictions even outside champ select
+                if prediction_display.predictions:
+                    prediction_display.display()
                 
                 summoner = client.get('/lol-summoner/v1/current-summoner')
                 if not summoner:
