@@ -144,31 +144,37 @@ def get_champion_name(champion_id, id_to_name):
 def build_optimized_model(
     input_dim,
     output_stats_dim,
-    layer1_units=512,
-    layer2_units=256,
-    layer3_units=128,
-    layer4_units=64,
-    stats_branch_units=128,
-    winner_branch1_units=128,
-    winner_branch2_units=64,
-    dropout_rate=0.35,
-    l2_reg=0.002,
+    layer1_units=320,
+    layer2_units=160,
+    layer3_units=80,
+    layer4_units=40,
+    stats_branch_units=80,
+    winner_branch1_units=120,
+    winner_branch2_units=60,
+    dropout_rate=0.28,
+    l2_reg=0.0012,
     use_batch_norm=True,
-    stats_weight=0.50,
-    winner_weight=0.50,
-    learning_rate=0.0005
+    stats_weight=0.12,
+    winner_weight=0.88,
+    learning_rate=0.0012
 ):
     """
-    EXACT model from original legendmodels.py
-    Optimized multi-task model for integer inputs (champion IDs)
-    predicting integer stats and binary winner.
+    EXACT model from LegendModels.ipynb - WinnerPrimary configuration
+    Architecture with 5 layers (4 shared + stats/winner branches)
+    Uses stats concatenation in winner branch for better predictions.
+    
+    Key differences from generic model:
+    - Stats output uses SIGMOID activation (for binary/normalized stats)
+    - Winner branch CONCATENATES shared layer + predicted stats
+    - Binary crossentropy for stats loss (not MAE)
+    - Winner weight = 0.88 (heavily favors winner prediction)
     """
     from tensorflow import keras
     
     # Input layer
     input_layer = keras.layers.Input(shape=(input_dim,), name='champion_input')
 
-    # Deep shared trunk with residual connections
+    # Layer 1: Deep shared trunk
     x = keras.layers.Dense(
         layer1_units,
         activation='relu',
@@ -178,6 +184,7 @@ def build_optimized_model(
         x = keras.layers.BatchNormalization()(x)
     x = keras.layers.Dropout(dropout_rate)(x)
 
+    # Layer 2
     x = keras.layers.Dense(
         layer2_units,
         activation='relu',
@@ -187,6 +194,7 @@ def build_optimized_model(
         x = keras.layers.BatchNormalization()(x)
     x = keras.layers.Dropout(dropout_rate)(x)
 
+    # Layer 3
     x = keras.layers.Dense(
         layer3_units,
         activation='relu',
@@ -196,6 +204,7 @@ def build_optimized_model(
         x = keras.layers.BatchNormalization()(x)
     x = keras.layers.Dropout(dropout_rate * 0.75)(x)
 
+    # Layer 4: Final shared layer
     shared = keras.layers.Dense(
         layer4_units,
         activation='relu',
@@ -205,7 +214,7 @@ def build_optimized_model(
         shared = keras.layers.BatchNormalization()(shared)
     shared = keras.layers.Dropout(dropout_rate * 0.5)(shared)
 
-    # Stats prediction branch
+    # Stats prediction branch (Layer 5a)
     stats_branch = keras.layers.Dense(
         stats_branch_units,
         activation='relu',
@@ -214,16 +223,18 @@ def build_optimized_model(
     if use_batch_norm:
         stats_branch = keras.layers.BatchNormalization()(stats_branch)
     stats_branch = keras.layers.Dropout(dropout_rate * 0.5)(stats_branch)
-
+    
+    # CRITICAL: Sigmoid activation for binary/normalized stats
     stats_output = keras.layers.Dense(
         output_stats_dim,
-        activation='sigmoid',  # Changed to sigmoid for 0/1 outputs
+        activation='sigmoid',
         name='stats_output'
     )(stats_branch)
 
-    # Winner prediction branch (uses shared + predicted stats)
+    # Winner prediction branch (Layer 5b)
+    # CRITICAL: Concatenate shared features WITH predicted stats
     winner_input = keras.layers.Concatenate()([shared, stats_output])
-
+    
     winner_branch = keras.layers.Dense(
         winner_branch1_units,
         activation='relu',
@@ -232,14 +243,14 @@ def build_optimized_model(
     if use_batch_norm:
         winner_branch = keras.layers.BatchNormalization()(winner_branch)
     winner_branch = keras.layers.Dropout(dropout_rate * 0.5)(winner_branch)
-
+    
     winner_branch = keras.layers.Dense(
         winner_branch2_units,
         activation='relu',
         kernel_regularizer=keras.regularizers.l2(l2_reg)
     )(winner_branch)
     winner_branch = keras.layers.Dropout(dropout_rate * 0.3)(winner_branch)
-
+    
     winner_output = keras.layers.Dense(
         1,
         activation='sigmoid',
@@ -249,7 +260,8 @@ def build_optimized_model(
     # Create model
     model = keras.Model(inputs=input_layer, outputs=[stats_output, winner_output])
 
-    # Compile
+    # Compile with multi-task loss
+    # CRITICAL: Binary crossentropy for both outputs (stats are 0/1)
     model.compile(
         optimizer=keras.optimizers.Adam(learning_rate=learning_rate),
         loss={
@@ -272,131 +284,86 @@ def build_optimized_model(
 
 
 def load_and_train_model():
-    """Load data and train the prediction model using EXACT original architecture"""
-    print("\n📊 Loading training data...")
+    """Train the model from CSV data"""
+    import warnings
+    warnings.filterwarnings('ignore')
+    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
     
-    if not Path(GAMES_CSV).exists():
-        print(f"❌ Error: {GAMES_CSV} not found!")
-        print(f"   Please place {GAMES_CSV} in the same directory as this script.")
-        sys.exit(1)
-    
-    try:
-        import tensorflow as tf
-        from tensorflow import keras
-        from sklearn.model_selection import train_test_split
-        from sklearn.preprocessing import StandardScaler
-    except ImportError as e:
-        print(f"❌ Missing required library: {e}")
-        print("   Install with: pip3 install tensorflow scikit-learn --break-system-packages")
-        sys.exit(1)
-    
-    # Load data
+    print(f"📊 Loading training data from {GAMES_CSV}...")
     games_df = pd.read_csv(GAMES_CSV)
-    print(f"✓ Loaded {len(games_df)} games")
     
-    # Drop unnecessary columns (EXACT from original)
-    drop_columns = ['gameId', 'creationTime', 't2_ban1', 't2_ban2', 't2_ban3', 't2_ban4',
-                    't2_ban5', 't1_ban1', 't1_ban2', 't1_ban3', 't1_ban4', 't1_ban5', 'seasonId',
-                    't1_champ1_sum1', 't1_champ1_sum2', 't1_champ2_sum1', 't1_champ2_sum2',
-                    't1_champ3_sum1', 't1_champ3_sum2', 't1_champ4_sum1', 't1_champ4_sum2',
-                    't1_champ5_sum1', 't1_champ5_sum2', 't2_champ1_sum1', 't2_champ1_sum2',
-                    't2_champ2_sum1', 't2_champ2_sum2', 't2_champ3_sum1', 't2_champ3_sum2',
-                    't2_champ4_sum1', 't2_champ4_sum2', 't2_champ5_sum1', 't2_champ5_sum2']
-    
-    games_df = games_df.drop(drop_columns, axis=1)
-    
-    # Define features (EXACT from original)
-    champion_features = [
-        't1_champ1id', 't1_champ2id', 't1_champ3id', 't1_champ4id', 't1_champ5id',
-        't2_champ1id', 't2_champ2id', 't2_champ3id', 't2_champ4id', 't2_champ5id'
-    ]
-    
+    # Define features
+    champion_features = [f't{t}_champ{i}id' for t in [1, 2] for i in range(1, 6)]
     stat_features = [
-        'firstBlood', 'firstTower', 'firstInhibitor', 'firstBaron',
-        'firstDragon', 'firstRiftHerald',
-        't1_towerKills', 't1_inhibitorKills', 't1_baronKills',
-        't1_dragonKills', 't1_riftHeraldKills',
-        't2_towerKills', 't2_inhibitorKills', 't2_baronKills',
-        't2_dragonKills', 't2_riftHeraldKills'
+        't1_towerKills', 't1_inhibitorKills', 't1_baronKills', 't1_dragonKills', 't1_riftHeraldKills',
+        't2_towerKills', 't2_inhibitorKills', 't2_baronKills', 't2_dragonKills', 't2_riftHeraldKills'
     ]
+    winner_feature = 'winner'
     
     # Clean data
-    games_df_clean = games_df.dropna(subset=champion_features + stat_features + ['winner'])
+    games_df_clean = games_df.dropna(subset=champion_features + stat_features + [winner_feature])
+    games_df_clean = games_df_clean[
+        (games_df_clean[champion_features] > 0).all(axis=1)
+    ]
     
+    print(f"✓ Loaded {len(games_df_clean)} games")
+    
+    # Prepare data
     X = games_df_clean[champion_features].values.astype(np.float32)
-    Y_stats_raw = games_df_clean[stat_features].values.astype(np.float32)
+    y_stats = games_df_clean[stat_features].values.astype(np.float32)
+    y_winner = (games_df_clean[winner_feature].values == 2).astype(np.float32)
     
-    # Convert binary stats (EXACT from original)
-    binary_stat_features = ['firstBlood', 'firstTower', 'firstInhibitor', 'firstBaron',
-                            'firstDragon', 'firstRiftHerald']
-    Y_stats = Y_stats_raw.copy()
-    
-    for i, stat_name in enumerate(stat_features):
-        if stat_name in binary_stat_features:
-            unique_vals = np.unique(Y_stats[:, i])
-            if set(unique_vals).issubset({1.0, 2.0}):
-                Y_stats[:, i] = Y_stats[:, i] - 1
-    
-    Y_winner = (games_df_clean['winner'].values - 1).reshape(-1, 1).astype(np.float32)
-    
-    # Split data (EXACT from original)
-    X_train, X_temp, Y_stats_train, Y_stats_temp, Y_winner_train, Y_winner_temp = train_test_split(
-        X, Y_stats, Y_winner, test_size=0.5, random_state=42, stratify=Y_winner
-    )
-    
-    X_val, X_test, Y_stats_val, Y_stats_test, Y_winner_val, Y_winner_test = train_test_split(
-        X_temp, Y_stats_temp, Y_winner_temp, test_size=0.6, random_state=42, stratify=Y_winner_temp
-    )
-    
-    # Scale stats
+    # Normalize stats
+    from sklearn.preprocessing import StandardScaler
     scaler_stats = StandardScaler()
-    Y_stats_train_scaled = scaler_stats.fit_transform(Y_stats_train)
-    Y_stats_val_scaled = scaler_stats.transform(Y_stats_val)
+    y_stats_scaled = scaler_stats.fit_transform(y_stats)
     
-    print("🏗️  Building model with EXACT original architecture...")
-    
-    # Get dimensions
-    input_dim = X.shape[1]
-    output_stats_dim = Y_stats.shape[1]
-    
-    # Build model with EXACT original parameters
+    # Build and train model with WinnerPrimary configuration
+    print("🧠 Training AI model (WinnerPrimary config)...")
     model = build_optimized_model(
-        input_dim=input_dim,
-        output_stats_dim=output_stats_dim
+        input_dim=len(champion_features),
+        output_stats_dim=len(stat_features),
+        layer1_units=320,
+        layer2_units=160,
+        layer3_units=80,
+        layer4_units=40,
+        stats_branch_units=80,
+        winner_branch1_units=120,
+        winner_branch2_units=60,
+        dropout_rate=0.28,
+        l2_reg=0.0012,
+        use_batch_norm=True,
+        stats_weight=0.12,
+        winner_weight=0.88,
+        learning_rate=0.0012
     )
     
-    print("🎓 Training model (this may take a few minutes)...")
-    
-    # Callbacks (EXACT from original)
+    # Train with early stopping
+    from tensorflow import keras
     early_stop = keras.callbacks.EarlyStopping(
         monitor='val_winner_output_accuracy',
         patience=20,
         restore_best_weights=True,
-        mode='max',
-        verbose=0
+        mode='max'
     )
-
+    
     reduce_lr = keras.callbacks.ReduceLROnPlateau(
         monitor='val_winner_output_loss',
         factor=0.5,
         patience=7,
         min_lr=0.00001,
-        mode='min',  # Monitor loss - lower is better
         verbose=0
     )
     
-    # Train (EXACT from original - epochs=150, batch=64)
-    history = model.fit(
-        X_train,
-        {'stats_output': Y_stats_train_scaled, 'winner_output': Y_winner_train},
-        validation_data=(X_val, {'stats_output': Y_stats_val_scaled, 'winner_output': Y_winner_val}),
+    model.fit(
+        X,
+        {'stats_output': y_stats_scaled, 'winner_output': y_winner},
+        validation_split=0.2,
         epochs=150,
         batch_size=64,
         callbacks=[early_stop, reduce_lr],
         verbose=0
     )
-    
-    print("✓ Model trained successfully!")
     
     # Get all unique champions
     all_champions = set()
@@ -440,31 +407,45 @@ def predict_winner(t1_champs, t2_champs, model, scaler, stat_features):
 
 
 
-def recommend_champion_for_team(team1_partial, team2_full, model, all_champions, top_n=5):
-    """Recommend champions for incomplete team"""
+def recommend_champion_for_team(team1_partial, team2_partial, model, all_champions, top_n=5):
+    """
+    Recommend champions for incomplete team.
+    FIXED: Now handles cases where BOTH teams are incomplete.
+    """
     # Clean the inputs
     team1_current = [c for c in team1_partial if c and c != 0]
-    team2_clean = [c for c in team2_full if c and c != 0]
+    team2_current = [c for c in team2_partial if c and c != 0]
     
-    if len(team1_current) >= 5 or len(team2_clean) != 5:
+    # Can't recommend if team1 is already full
+    if len(team1_current) >= 5:
         return []
     
-    num_missing = 5 - len(team1_current)
-    already_picked = set(team1_current + team2_clean)
+    # Calculate missing slots for both teams
+    team1_missing = 5 - len(team1_current)
+    team2_missing = 5 - len(team2_current)
+    
+    # Get already picked champions
+    already_picked = set(team1_current + team2_current)
     available_champions = [c for c in all_champions if c not in already_picked]
     
-    team1_base = team1_current + [0] * num_missing
+    # Pad both teams to 5 champions
+    team1_base = team1_current + [0] * team1_missing
+    team2_base = team2_current + [0] * team2_missing
+    
     results = []
     
     try:
         for champion_id in available_champions:
+            # Test adding this champion to team1
             team1_test = team1_base.copy()
             first_empty_idx = team1_test.index(0)
             team1_test[first_empty_idx] = champion_id
             
-            game_input = np.array([team1_test + team2_clean], dtype=np.float32)
+            # Create full game input
+            game_input = np.array([team1_test + team2_base], dtype=np.float32)
             _, winner_pred = model.predict(game_input, verbose=0)
             
+            # Team1 win probability
             team1_win_prob = (1 - winner_pred[0][0]) * 100
             
             results.append({
@@ -493,16 +474,25 @@ class PredictionLog:
     def __init__(self):
         self.logs = []
         self.current_session_id = None
+        self.predictions_made = set()  # Track which predictions we've made
     
     def new_session(self):
         """Start a new champion select session"""
         self.logs = []
+        self.predictions_made = set()
         self.current_session_id = time.time()
     
-    def add_prediction(self, message):
+    def add_prediction(self, message, prediction_key=None):
         """Add a prediction to the log"""
+        # Prevent duplicate predictions for the same stage
+        if prediction_key and prediction_key in self.predictions_made:
+            return
+        
         timestamp = time.strftime('%H:%M:%S')
         self.logs.append(f"[{timestamp}] {message}")
+        
+        if prediction_key:
+            self.predictions_made.add(prediction_key)
     
     def display(self):
         """Display all logged predictions"""
@@ -595,11 +585,11 @@ def display_session(session, id_to_name, model, scaler, stat_features, all_champ
         if champion_id > 0:
             champ_name = get_champion_name(champion_id, id_to_name)
             status = "✅ LOCKED"
-            display_name = champ_name or f"Champion {champion_id}"
+            display_name = champ_name
         elif intent_id > 0:
             champ_name = get_champion_name(intent_id, id_to_name)
             status = "👀 Hovering"
-            display_name = champ_name or f"Champion {intent_id}"
+            display_name = champ_name
         else:
             display_name = "Not selected"
             status = "⏳ Waiting"
@@ -624,11 +614,11 @@ def display_session(session, id_to_name, model, scaler, stat_features, all_champ
             
             if champion_id > 0:
                 champ_name = get_champion_name(champion_id, id_to_name)
-                display_name = champ_name or f"Champion {champion_id}"
+                display_name = champ_name
                 status = "✅ LOCKED"
             elif intent_id > 0:
                 champ_name = get_champion_name(intent_id, id_to_name)
-                display_name = champ_name or f"Champion {intent_id}"
+                display_name = champ_name
                 status = "👀 Hovering"
             else:
                 display_name = "Not selected"
@@ -668,7 +658,7 @@ def display_session(session, id_to_name, model, scaler, stat_features, all_champ
                 team2_prob = prediction['team2_probability']
                 
                 msg = f"🎯 FINAL PREDICTION: Your Team {team1_prob:.1f}% | Enemy {team2_prob:.1f}%"
-                prediction_log.add_prediction(msg)
+                prediction_log.add_prediction(msg, prediction_key="final")
                 
                 # Better thresholds for matchup evaluation
                 diff = abs(team1_prob - team2_prob)
@@ -686,90 +676,95 @@ def display_session(session, id_to_name, model, scaler, stat_features, all_champ
                     prediction_log.add_prediction("   ⚖️  Even matchup!")
         
         # During picking phase - predict based on League's 1-2-2-2-2-1 format
-        # We need to handle both scenarios:
         # Blue side (your team): You(1) -> Enemy(2,3) -> You(4,5) -> Enemy(6,7) -> You(8,9) -> Enemy(10)
         # Red side (enemy team): Enemy(1) -> You(2,3) -> Enemy(4,5) -> You(6,7) -> Enemy(8,9) -> You(10)
         elif total_picks > 0 and total_picks < 10:
             should_predict = False
             predict_for_enemy = False
+            prediction_stage = None
             
-            # Detect which side has first pick by checking pick 1
-            # If your team has more picks when total is 1, you had first pick (blue side)
-            # Otherwise, enemy had first pick (red side)
-            
-            # At total_picks == 1, whoever has 1 pick is the first picker
-            if total_picks == 1:
-                # Skip prediction after first pick regardless of who picked
-                pass
-            
-            # After 3 total picks (1-2-3 pattern complete)
-            elif total_picks == 3:
-                # If your team has 1 pick, enemy picked 2-3, recommend for your team
-                # If enemy has 1 pick, you picked 2-3, predict enemy
+            # After 3 total picks (1-2-2 pattern complete) - Prediction #1
+            if total_picks == 3:
+                should_predict = True
+                prediction_stage = "stage_3"
+                # If your team has 1 pick, enemy picked 2-3, recommend for your team (picks 4-5)
+                # If enemy has 1 pick, you picked 2-3, predict enemy (picks 4-5)
                 if total_my_picks == 1:
-                    should_predict = True
-                    predict_for_enemy = False  # Recommend for your team (picks 4-5)
+                    predict_for_enemy = False
                 elif total_their_picks == 1:
-                    should_predict = True
-                    predict_for_enemy = True  # Predict enemy (picks 4-5)
+                    predict_for_enemy = True
             
-            # After 5 total picks
+            # After 5 total picks (1-2-2-2 pattern complete) - Prediction #2
             elif total_picks == 5:
+                should_predict = True
+                prediction_stage = "stage_5"
                 # Whoever has 3 picks just finished their 4-5 picks
                 if total_my_picks == 3:
-                    should_predict = True
                     predict_for_enemy = True  # Predict enemy (picks 6-7)
                 elif total_their_picks == 3:
-                    should_predict = True
                     predict_for_enemy = False  # Recommend for your team (picks 6-7)
             
-            # After 7 total picks
+            # After 7 total picks (1-2-2-2-2 pattern complete) - Prediction #3
             elif total_picks == 7:
+                should_predict = True
+                prediction_stage = "stage_7"
                 # Whoever has 4 picks just finished their 6-7 picks
                 if total_my_picks == 4:
-                    should_predict = True
                     predict_for_enemy = True  # Predict enemy (picks 8-9)
                 elif total_their_picks == 4:
-                    should_predict = True
                     predict_for_enemy = False  # Recommend for your team (picks 8-9)
             
-            # After 9 total picks
+            # After 9 total picks (1-2-2-2-2-1 pattern complete) - Prediction #4
             elif total_picks == 9:
+                should_predict = True
+                prediction_stage = "stage_9"
                 # Whoever has 5 picks just finished their 8-9 picks
                 if total_my_picks == 5:
-                    should_predict = True
                     predict_for_enemy = True  # Predict enemy (pick 10)
                 elif total_their_picks == 5:
-                    should_predict = True
                     predict_for_enemy = False  # Recommend for your team (pick 10)
             
             # Make the prediction
-            if should_predict:
-                if predict_for_enemy and total_their_picks < 5:
+            if should_predict and prediction_stage:
+                if predict_for_enemy:
                     # Predict what enemy will pick
                     their_team_partial = their_team_locked + their_team_hovering
+                    my_team_partial = my_team_locked
+                    
                     recommendations = recommend_champion_for_team(
-                        their_team_partial, my_team_locked, model, all_champions, top_n=3
+                        their_team_partial, my_team_partial, model, all_champions, top_n=3
                     )
                     
                     if recommendations:
-                        prediction_log.add_prediction(f"👁️  ENEMY LIKELY TO PICK:")
+                        prediction_log.add_prediction(
+                            f"👁️  ENEMY LIKELY TO PICK:",
+                            prediction_key=prediction_stage
+                        )
                         for i, rec in enumerate(recommendations[:3], 1):
                             champ_name = get_champion_name(rec['champion_id'], id_to_name)
-                            prediction_log.add_prediction(f"   {i}. {champ_name:20} → {rec['win_probability']:.1f}% (for them)")
+                            prediction_log.add_prediction(
+                                f"   {i}. {champ_name:20} → {rec['win_probability']:.1f}% (for them)"
+                            )
                 
-                elif not predict_for_enemy and total_my_picks < 5:
+                else:
                     # Recommend for your team
                     my_team_partial = my_team_locked + my_team_hovering
+                    their_team_partial = their_team_locked
+                    
                     recommendations = recommend_champion_for_team(
-                        my_team_partial, their_team_locked, model, all_champions, top_n=5
+                        my_team_partial, their_team_partial, model, all_champions, top_n=5
                     )
                     
                     if recommendations:
-                        prediction_log.add_prediction(f"💡 RECOMMENDATIONS FOR YOUR TEAM:")
+                        prediction_log.add_prediction(
+                            f"💡 RECOMMENDATIONS FOR YOUR TEAM:",
+                            prediction_key=prediction_stage
+                        )
                         for i, rec in enumerate(recommendations[:5], 1):
                             champ_name = get_champion_name(rec['champion_id'], id_to_name)
-                            prediction_log.add_prediction(f"   {i}. {champ_name:20} → {rec['win_probability']:.1f}%")
+                            prediction_log.add_prediction(
+                                f"   {i}. {champ_name:20} → {rec['win_probability']:.1f}%"
+                            )
 
     
     # Display persistent log
