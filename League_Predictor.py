@@ -29,8 +29,8 @@ requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
 # Configuration
 LOCKFILE_PATH = "/Applications/League of Legends.app/Contents/LoL/lockfile"
 UPDATE_INTERVAL = 1.5
-GAMES_CSV = "games.csv"
-CHAMPION_JSON = "champion_info.json"
+GAMES_CSV = "data/games.csv"
+CHAMPION_JSON = "data/champion_info.json"
 
 # ============================================================
 # LEAGUE CLIENT CONNECTION
